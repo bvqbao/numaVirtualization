@@ -1,2 +1,2 @@
 # Numa Virtualization
-This repository hosts patch files for the paper "When eXtended Para-Virtualization Meets NUMA", EuroSys 2019.
+This repository hosts patch files for the paper "When eXtended Para-Virtualization (XPV) Meets NUMA", EuroSys 2019.
