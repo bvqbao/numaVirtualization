@@ -1,0 +1,219 @@
+diff --git a/tools/include/xen-foreign/reference.size b/tools/include/xen-foreign/reference.size
+index a0409db..c1e9d21 100644
+--- a/tools/include/xen-foreign/reference.size
++++ b/tools/include/xen-foreign/reference.size
+@@ -10,5 +10,5 @@ arch_vcpu_info            |       0       0      24      16
+ vcpu_time_info            |      32      32      32      32
+ vcpu_info                 |      48      48      64      64
+ arch_shared_info          |       0       0      28      48
+-shared_info               |    1088    1088    2344    3136
++shared_info               |    1096    1096    2376    3168
+ 
+diff --git a/tools/include/xen-foreign/structs.py b/tools/include/xen-foreign/structs.py
+index 3d9f2fe..fe23e20 100644
+--- a/tools/include/xen-foreign/structs.py
++++ b/tools/include/xen-foreign/structs.py
+@@ -56,6 +56,7 @@ defines = [ "__arm__",
+             "xen_pfn_to_cr3",
+             "xen_cr3_to_pfn",
+             "XEN_LEGACY_MAX_VCPUS",
++            "XEN_NUMNODES",
+             "MAX_GUEST_CMDLINE" ];
+ 
+ # Architectures which must be compatible, i.e. identical
+diff --git a/xen/arch/x86/domain.c b/xen/arch/x86/domain.c
+index 765bc00..d289796 100644
+--- a/xen/arch/x86/domain.c
++++ b/xen/arch/x86/domain.c
+@@ -900,6 +900,7 @@ int arch_set_info_guest(
+     unsigned long flags, cr4;
+     unsigned int i;
+     int rc = 0, compat;
++    uint8_t node_id = cpu_to_node(v->processor);
+ 
+     /* The context is a compat-mode one if the target domain is compat-mode;
+      * we expect the tools to DTRT even in compat-mode callers. */
+@@ -1267,6 +1268,9 @@ int arch_set_info_guest(
+     if ( v->vcpu_id == 0 )
+         update_domain_wallclock_time(d);
+ 
++    if ( d->domain_id != 0 && is_pv_domain(d) )
++        shared_info(d, vcpu_to_pnode)[v->vcpu_id] = node_id;
++
+     /* Don't redo final setup */
+     v->is_initialised = 1;
+ 
+diff --git a/xen/common/event_channel.c b/xen/common/event_channel.c
+index c69f9db..c6d3caa 100644
+--- a/xen/common/event_channel.c
++++ b/xen/common/event_channel.c
+@@ -105,6 +105,7 @@ static int virq_is_global(uint32_t virq)
+     case VIRQ_DEBUG:
+     case VIRQ_XENOPROF:
+     case VIRQ_XENPMU:
++    case VIRQ_TOPOLOGY:
+         rc = 0;
+         break;
+     case VIRQ_ARCH_0 ... VIRQ_ARCH_7:
+diff --git a/xen/common/memory.c b/xen/common/memory.c
+index d0703aa..264d07b 100644
+--- a/xen/common/memory.c
++++ b/xen/common/memory.c
+@@ -1358,6 +1358,66 @@ long do_memory_op(unsigned long cmd, XEN_GUEST_HANDLE_PARAM(void) arg)
+         break;
+     }
+ 
++    case XENMEM_get_numainfo:
++    {
++	int i, j, num_nodes;
++	unsigned int *distance, *memnode_map;
++	unsigned long *memranges;
++	struct xen_numa_topology_info topology;
++
++	if ( copy_from_guest(&topology, arg, 1) )
++		return -EFAULT;
++
++	num_nodes = num_online_nodes();
++	if (num_nodes > XEN_NUMNODES)
++		num_nodes = XEN_NUMNODES;
++
++	distance = xmalloc_array(unsigned int, XEN_NUMNODES * XEN_NUMNODES);
++	memnode_map = xmalloc_array(unsigned int, XEN_NUMNODES);
++	memranges = xmalloc_array(unsigned long, 2 * num_nodes);
++
++	if ( distance == NULL || memranges == NULL ||
++		memnode_map == NULL ) {
++		rc = -ENOMEM;
++		goto numainfo_out;
++	}
++
++	rc = -EFAULT;
++
++	for( i = 0; i < num_nodes; i++ ) {
++		for ( j = 0; j < num_nodes; j++ )
++			distance[i*XEN_NUMNODES+j] = __node_distance(i, j);
++
++		memranges[2*i] = node_start_pfn(i);
++		memranges[2*i+1] = node_spanned_pages(i);
++
++		memnode_map[i] = node_isset(i, curr_d->node_affinity);
++	}
++
++	if ( copy_to_guest(topology.distance, distance,
++			XEN_NUMNODES * XEN_NUMNODES) != 0 )
++		goto numainfo_out;
++
++	if ( copy_to_guest(topology.memnode_map, memnode_map,
++			XEN_NUMNODES) != 0 )
++		goto numainfo_out;
++
++	if ( copy_to_guest(topology.memranges, memranges,
++			2 * num_nodes) != 0 )
++		goto numainfo_out;
++
++	topology.nr_nodes = num_nodes;
++	topology.nr_cpus = curr_d->max_vcpus;
++
++	rc = __copy_to_guest(arg, &topology, 1) ? -EFAULT : 0;
++
++numainfo_out:
++	xfree(distance);
++	xfree(memnode_map);
++	xfree(memranges);
++	break;
++    }
++
+ #ifdef CONFIG_HAS_PASSTHROUGH
+     case XENMEM_reserved_device_memory_map:
+     {
+diff --git a/xen/common/schedule.c b/xen/common/schedule.c
+index 1058e19..271e5b4 100644
+--- a/xen/common/schedule.c
++++ b/xen/common/schedule.c
+@@ -1390,6 +1390,8 @@ static void schedule(void)
+     spinlock_t           *lock;
+     struct task_slice     next_slice;
+     int cpu = smp_processor_id();
++    struct domain        *domain;
++    uint8_t current_node, last_node;
+ 
+     ASSERT_NOT_IN_ATOMIC();
+ 
+@@ -1487,6 +1489,21 @@ static void schedule(void)
+ 
+     vcpu_periodic_timer_work(next);
+ 
++    domain = next->domain;
++
++    if ( domain->domain_id != 0 && !is_idle_domain(domain)
++             && is_pv_domain(domain) )
++    {
++        last_node = shared_info(domain, vcpu_to_pnode)[next->vcpu_id];
++        current_node = cpu_to_node(cpu);
++
++        if ( last_node != current_node )
++        {
++            shared_info(domain, vcpu_to_pnode)[next->vcpu_id] = current_node;
++            send_guest_vcpu_virq(next, VIRQ_TOPOLOGY);
++        }
++    }
++
+     context_switch(prev, next);
+ }
+ 
+diff --git a/xen/include/public/memory.h b/xen/include/public/memory.h
+index 6eee0c8..9b75f23 100644
+--- a/xen/include/public/memory.h
++++ b/xen/include/public/memory.h
+@@ -648,7 +648,21 @@ struct xen_vnuma_topology_info {
+ typedef struct xen_vnuma_topology_info xen_vnuma_topology_info_t;
+ DEFINE_XEN_GUEST_HANDLE(xen_vnuma_topology_info_t);
+ 
+-/* Next available subop number is 28 */
++#define XENMEM_get_numainfo             28
++
++struct xen_numa_topology_info {
++	/* Machine/physical information */
++	unsigned int nr_nodes;
++	XEN_GUEST_HANDLE(xen_ulong_t) memranges;
++	XEN_GUEST_HANDLE(uint) distance;
++
++	/* VM information */
++	unsigned int nr_cpus;
++	XEN_GUEST_HANDLE(uint) memnode_map;
++};
++
++typedef struct xen_numa_topology_info xen_numa_topology_info_t;
++DEFINE_XEN_GUEST_HANDLE(xen_numa_topology_info_t);
+ 
+ #endif /* __XEN_PUBLIC_MEMORY_H__ */
+ 
+diff --git a/xen/include/public/xen.h b/xen/include/public/xen.h
+index 2ac6b1e..737fe82 100644
+--- a/xen/include/public/xen.h
++++ b/xen/include/public/xen.h
+@@ -181,6 +181,7 @@ DEFINE_XEN_GUEST_HANDLE(xen_ulong_t);
+ #define VIRQ_XC_RESERVED 11 /* G. Reserved for XenClient                     */
+ #define VIRQ_ENOMEM     12 /* G. (DOM0) Low on heap memory       */
+ #define VIRQ_XENPMU     13 /* V.  PMC interrupt                              */
++#define VIRQ_TOPOLOGY   14 /* V. Topology has been changed.                  */
+ 
+ /* Architecture-specific VIRQ definitions. */
+ #define VIRQ_ARCH_0    16
+@@ -692,6 +693,8 @@ struct vcpu_info {
+ typedef struct vcpu_info vcpu_info_t;
+ #endif
+ 
++#define XEN_NUMNODES	16
++
+ /*
+  * `incontents 200 startofday_shared Start-of-day shared data structure
+  * Xen/kernel shared data -- pointer provided in start_info.
+@@ -754,6 +757,7 @@ struct shared_info {
+ 
+     struct arch_shared_info arch;
+ 
++    uint8_t vcpu_to_pnode[XEN_LEGACY_MAX_VCPUS];
+ };
+ #ifndef __XEN__
+ typedef struct shared_info shared_info_t;

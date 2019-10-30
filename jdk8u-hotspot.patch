@@ -1,0 +1,225 @@
+diff --git a/hotspot/src/os/linux/vm/os_linux.cpp b/hotspot/src/os/linux/vm/os_linux.cpp
+index 044a70a..93feb0a 100644
+--- a/hotspot/src/os/linux/vm/os_linux.cpp
++++ b/hotspot/src/os/linux/vm/os_linux.cpp
+@@ -2733,7 +2733,16 @@ void os::numa_make_local(char *addr, size_t bytes, int lgrp_hint) {
+   Linux::numa_tonode_memory(addr, bytes, lgrp_hint);
+ }
+
+-bool os::numa_topology_changed()   { return false; }
++bool os::numa_topology_changed() {
++  unsigned long current_version = Linux::numa_topology_version();
++  if (current_version &&
++	current_version != Linux::_topology_version) {
++    Linux::_topology_version = current_version;
++    Linux::rebuild_cpu_to_node_map();
++    return true;
++  }
++  return false;
++}
+
+ size_t os::numa_get_groups_num() {
+   // Return just the number of nodes in which it's possible to allocate memory
+@@ -2867,11 +2876,15 @@ bool os::Linux::libnuma_init() {
+                                                libnuma_dlsym(handle, "numa_bitmask_isbitset")));
+       set_numa_distance(CAST_TO_FN_PTR(numa_distance_func_t,
+                                        libnuma_dlsym(handle, "numa_distance")));
++      set_numa_topology_version(CAST_TO_FN_PTR(numa_topology_version_func_t,
++				       libnuma_dlsym(handle, "numa_topology_version")));
+
+       if (numa_available() != -1) {
+         set_numa_all_nodes((unsigned long*)libnuma_dlsym(handle, "numa_all_nodes"));
+         set_numa_all_nodes_ptr((struct bitmask **)libnuma_dlsym(handle, "numa_all_nodes_ptr"));
+         set_numa_nodes_ptr((struct bitmask **)libnuma_dlsym(handle, "numa_nodes_ptr"));
++        // Initialize the topology version
++        _topology_version = numa_topology_version();
+         // Create an index -> node mapping, since nodes are not always consecutive
+         _nindex_to_node = new (ResourceObj::C_HEAP, mtInternal) GrowableArray<int>(0, true);
+         rebuild_nindex_to_node_map();
+@@ -2918,43 +2931,14 @@ void os::Linux::rebuild_cpu_to_node_map() {
+
+   size_t node_num = get_existing_num_nodes();
+
+-  int distance = 0;
+-  int closest_distance = INT_MAX;
+-  int closest_node = 0;
+   unsigned long *cpu_map = NEW_C_HEAP_ARRAY(unsigned long, cpu_map_size, mtInternal);
+   for (size_t i = 0; i < node_num; i++) {
+-    // Check if node is configured (not a memory-less node). If it is not, find
+-    // the closest configured node.
+-    if (!isnode_in_configured_nodes(nindex_to_node()->at(i))) {
+-      closest_distance = INT_MAX;
+-      // Check distance from all remaining nodes in the system. Ignore distance
+-      // from itself and from another non-configured node.
+-      for (size_t m = 0; m < node_num; m++) {
+-        if (m != i && isnode_in_configured_nodes(nindex_to_node()->at(m))) {
+-          distance = numa_distance(nindex_to_node()->at(i), nindex_to_node()->at(m));
+-          // If a closest node is found, update. There is always at least one
+-          // configured node in the system so there is always at least one node
+-          // close.
+-          if (distance != 0 && distance < closest_distance) {
+-            closest_distance = distance;
+-            closest_node = nindex_to_node()->at(m);
+-          }
+-        }
+-      }
+-     } else {
+-       // Current node is already a configured node.
+-       closest_node = nindex_to_node()->at(i);
+-     }
+-
+-    // Get cpus from the original node and map them to the closest node. If node
+-    // is a configured node (not a memory-less node), then original node and
+-    // closest node are the same.
+     if (numa_node_to_cpus(nindex_to_node()->at(i), cpu_map, cpu_map_size * sizeof(unsigned long)) != -1) {
+       for (size_t j = 0; j < cpu_map_valid_size; j++) {
+         if (cpu_map[j] != 0) {
+           for (size_t k = 0; k < BitsPerCLong; k++) {
+             if (cpu_map[j] & (1UL << k)) {
+-              cpu_to_node()->at_put(j * BitsPerCLong + k, closest_node);
++              cpu_to_node()->at_put(j * BitsPerCLong + k, nindex_to_node()->at(i));
+             }
+           }
+         }
+@@ -2984,9 +2968,11 @@ os::Linux::numa_interleave_memory_v2_func_t os::Linux::_numa_interleave_memory_v
+ os::Linux::numa_set_bind_policy_func_t os::Linux::_numa_set_bind_policy;
+ os::Linux::numa_bitmask_isbitset_func_t os::Linux::_numa_bitmask_isbitset;
+ os::Linux::numa_distance_func_t os::Linux::_numa_distance;
++os::Linux::numa_topology_version_func_t os::Linux::_numa_topology_version;
+ unsigned long* os::Linux::_numa_all_nodes;
+ struct bitmask* os::Linux::_numa_all_nodes_ptr;
+ struct bitmask* os::Linux::_numa_nodes_ptr;
++unsigned long os::Linux::_topology_version;
+
+ bool os::pd_uncommit_memory(char* addr, size_t size) {
+   uintptr_t res = (uintptr_t) ::mmap(addr, size, PROT_NONE,
+diff --git a/hotspot/src/os/linux/vm/os_linux.hpp b/hotspot/src/os/linux/vm/os_linux.hpp
+index c56983c..a31a5bd 100644
+--- a/hotspot/src/os/linux/vm/os_linux.hpp
++++ b/hotspot/src/os/linux/vm/os_linux.hpp
+@@ -68,6 +68,7 @@ class Linux {
+
+   static GrowableArray<int>* _cpu_to_node;
+   static GrowableArray<int>* _nindex_to_node;
++  static unsigned long _topology_version;
+
+  protected:
+
+@@ -257,6 +258,7 @@ private:
+   typedef void (*numa_set_bind_policy_func_t)(int policy);
+   typedef int (*numa_bitmask_isbitset_func_t)(struct bitmask *bmp, unsigned int n);
+   typedef int (*numa_distance_func_t)(int node1, int node2);
++  typedef unsigned long (*numa_topology_version_func_t)(void);
+
+   static sched_getcpu_func_t _sched_getcpu;
+   static numa_node_to_cpus_func_t _numa_node_to_cpus;
+@@ -269,6 +271,7 @@ private:
+   static numa_set_bind_policy_func_t _numa_set_bind_policy;
+   static numa_bitmask_isbitset_func_t _numa_bitmask_isbitset;
+   static numa_distance_func_t _numa_distance;
++  static numa_topology_version_func_t _numa_topology_version;
+   static unsigned long* _numa_all_nodes;
+   static struct bitmask* _numa_all_nodes_ptr;
+   static struct bitmask* _numa_nodes_ptr;
+@@ -284,6 +287,7 @@ private:
+   static void set_numa_set_bind_policy(numa_set_bind_policy_func_t func) { _numa_set_bind_policy = func; }
+   static void set_numa_bitmask_isbitset(numa_bitmask_isbitset_func_t func) { _numa_bitmask_isbitset = func; }
+   static void set_numa_distance(numa_distance_func_t func) { _numa_distance = func; }
++  static void set_numa_topology_version(numa_topology_version_func_t func) { _numa_topology_version = func; }
+   static void set_numa_all_nodes(unsigned long* ptr) { _numa_all_nodes = ptr; }
+   static void set_numa_all_nodes_ptr(struct bitmask **ptr) { _numa_all_nodes_ptr = *ptr; }
+   static void set_numa_nodes_ptr(struct bitmask **ptr) { _numa_nodes_ptr = *ptr; }
+@@ -317,6 +321,9 @@ public:
+   static int numa_distance(int node1, int node2) {
+     return _numa_distance != NULL ? _numa_distance(node1, node2) : -1;
+   }
++  static unsigned long numa_topology_version(void) {
++    return _numa_topology_version != NULL ? _numa_topology_version() : 0;
++  }
+   static int get_node_by_cpu(int cpu_id);
+   static int get_existing_num_nodes();
+   // Check if numa node is configured (non-zero memory node).
+diff --git a/hotspot/src/share/vm/gc_implementation/shared/mutableNUMASpace.cpp b/hotspot/src/share/vm/gc_implementation/shared/mutableNUMASpace.cpp
+index 9a9ed05..3a0d21c 100644
+--- a/hotspot/src/share/vm/gc_implementation/shared/mutableNUMASpace.cpp
++++ b/hotspot/src/share/vm/gc_implementation/shared/mutableNUMASpace.cpp
+@@ -239,50 +239,48 @@ bool MutableNUMASpace::update_layout(bool force) {
+   // Check if the topology had changed.
+   bool changed = os::numa_topology_changed();
+   if (force || changed) {
+-    // Compute lgrp intersection. Add/remove spaces.
+-    int lgrp_limit = (int)os::numa_get_groups_num();
+-    int *lgrp_ids = NEW_C_HEAP_ARRAY(int, lgrp_limit, mtGC);
+-    int lgrp_num = (int)os::numa_get_leaf_groups(lgrp_ids, lgrp_limit);
++    int lgrp_num = (int)os::numa_get_groups_num();
+     assert(lgrp_num > 0, "There should be at least one locality group");
+-    // Add new spaces for the new nodes
+-    for (int i = 0; i < lgrp_num; i++) {
+-      bool found = false;
+-      for (int j = 0; j < lgrp_spaces()->length(); j++) {
+-        if (lgrp_spaces()->at(j)->lgrp_id() == lgrp_ids[i]) {
+-          found = true;
+-          break;
++
++    if (lgrp_num != lgrp_spaces()->length()) {
++      // Add new spaces for the new nodes
++      for (int i = 0; i < lgrp_num; i++) {
++        bool found = false;
++        for (int j = 0; j < lgrp_spaces()->length(); j++) {
++          if (lgrp_spaces()->at(j)->lgrp_id() == i) {
++            found = true;
++            break;
++          }
++        }
++        if (!found) {
++          lgrp_spaces()->append(new LGRPSpace(i, alignment()));
+         }
+       }
+-      if (!found) {
+-        lgrp_spaces()->append(new LGRPSpace(lgrp_ids[i], alignment()));
+-      }
+-    }
+
+-    // Remove spaces for the removed nodes.
+-    for (int i = 0; i < lgrp_spaces()->length();) {
+-      bool found = false;
+-      for (int j = 0; j < lgrp_num; j++) {
+-        if (lgrp_spaces()->at(i)->lgrp_id() == lgrp_ids[j]) {
+-          found = true;
+-          break;
++      // Remove spaces for the removed nodes.
++      for (int i = 0; i < lgrp_spaces()->length();) {
++        bool found = false;
++        for (int j = 0; j < lgrp_num; j++) {
++          if (lgrp_spaces()->at(i)->lgrp_id() == j) {
++            found = true;
++            break;
++          }
++        }
++        if (!found) {
++          delete lgrp_spaces()->at(i);
++          lgrp_spaces()->remove_at(i);
++        } else {
++          i++;
+         }
+-      }
+-      if (!found) {
+-        delete lgrp_spaces()->at(i);
+-        lgrp_spaces()->remove_at(i);
+-      } else {
+-        i++;
+       }
+     }
+
+-    FREE_C_HEAP_ARRAY(int, lgrp_ids, mtGC);
+-
+     if (changed) {
+       for (JavaThread *thread = Threads::first(); thread; thread = thread->next()) {
+         thread->set_lgrp_id(-1);
+       }
+     }
+-    return true;
++    return force;
+   }
+   return false;
+ }
